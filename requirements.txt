@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+langgraph
+langchain
+langchain-openai
+langchain-community
+tavily-python
+sse-starlette
+python-dotenv
+pydantic
+typing-extensions
