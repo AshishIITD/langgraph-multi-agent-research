@@ -2,10 +2,12 @@ fastapi
 uvicorn
 langgraph
 langchain
-langchain-openai
+langchain-google-genai
 langchain-community
+langchain-experimental
 tavily-python
 sse-starlette
 python-dotenv
 pydantic
 typing-extensions
+google-generativeai
