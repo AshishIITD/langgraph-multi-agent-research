@@ -1,90 +1,178 @@
+"""
+Agent nodes for the LangGraph multi-agent system.
+Each returns a partial state update dict.
+"""
 import os
-from typing import Annotated, Sequence, TypedDict
-import operator
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import ToolNode
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_experimental.tools import PythonREPLTool
-from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from state import AgentState
+from tools import web_search, python_repl, format_report, TOOL_MAP
+from loguru import logger
+import json
 
-load_dotenv()
 
-LOCAL_MODEL = "llama3.1:8b"   # Runs via Ollama — no API key needed
+def get_llm(bind_tools: list = None):
+    provider = os.getenv("LLM_PROVIDER", "openai")
+    if provider == "anthropic":
+        llm = ChatAnthropic(
+            model="claude-sonnet-4-6",
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
+            temperature=0.1,
+        )
+    else:
+        llm = ChatOpenAI(
+            model=os.getenv("LLM_MODEL", "gpt-4o"),
+            api_key=os.getenv("OPENAI_API_KEY"),
+            temperature=0.1,
+        )
+    if bind_tools:
+        llm = llm.bind_tools(bind_tools)
+    return llm
 
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], operator.add]
-    next_agent: str
-    status: str
 
-# Only use Tavily if API key is available, otherwise skip web search
-try:
-    tavily_tool = TavilySearchResults(max_results=3)
-    tools = [tavily_tool, PythonREPLTool()]
-except Exception:
-    tools = [PythonREPLTool()]
+# ── Supervisor ────────────────────────────────────────────────────────────────
+def supervisor_node(state: AgentState) -> dict:
+    """Decides which agent to run next based on current state."""
+    logger.info("[Supervisor] Deciding next agent...")
+    iteration = state.get("iteration", 0)
+    max_iter = state.get("max_iterations", 5)
 
-python_repl_tool = PythonREPLTool()
-llm = ChatOllama(model=LOCAL_MODEL, temperature=0)
+    if state.get("is_complete") or iteration >= max_iter:
+        return {"next_agent": "END", "is_complete": True}
 
-def create_agent(llm, agent_tools, system_prompt: str):
-    prompt = SystemMessage(content=system_prompt)
-    bound_llm = llm.bind_tools(agent_tools) if agent_tools else llm
+    if not state.get("research_notes"):
+        return {"next_agent": "researcher", "iteration": iteration + 1}
+    if not state.get("draft_answer"):
+        return {"next_agent": "writer", "iteration": iteration + 1}
+    if not state.get("critic_feedback"):
+        return {"next_agent": "critic", "iteration": iteration + 1}
 
-    def agent_node(state: AgentState):
-        messages = [prompt] + list(state["messages"])
-        response = bound_llm.invoke(messages)
-        return {"messages": [response]}
-    return agent_node
+    llm = get_llm()
+    system = """You are a supervisor managing a research team. Based on the current state, 
+    decide the next step. Respond ONLY with one of: researcher, analyst, writer, critic, END
+    - researcher: need more information
+    - analyst: need to compute or analyze data
+    - writer: ready to write/improve the answer
+    - critic: answer written, needs evaluation
+    - END: answer is complete and high quality"""
 
-def supervisor_node(state: AgentState):
-    system_prompt = """You are a Supervisor managing: Researcher, Analyst, Writer, Critic.
-Review the conversation and decide who acts next.
-If the report is final and approved, respond EXACTLY 'FINISH'.
-Otherwise respond EXACTLY with one of: 'Researcher', 'Analyst', 'Writer', 'Critic'."""
-    messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
+    summary = f"""Task: {state['task']}
+Research notes: {len(state.get('research_notes', []))} items collected
+Draft answer: {'Yes' if state.get('draft_answer') else 'No'}
+Critic feedback: {state.get('critic_feedback', 'None')}
+Iteration: {iteration}/{max_iter}"""
+
+    response = llm.invoke([SystemMessage(content=system), HumanMessage(content=summary)])
+    next_agent = response.content.strip().lower()
+    if next_agent not in ["researcher", "analyst", "writer", "critic", "end"]:
+        next_agent = "END"
+
+    logger.info(f"[Supervisor] → {next_agent}")
+    return {"next_agent": next_agent, "iteration": iteration + 1}
+
+
+# ── Researcher ────────────────────────────────────────────────────────────────
+def researcher_node(state: AgentState) -> dict:
+    """Uses web search to gather information on the task."""
+    logger.info("[Researcher] Starting research...")
+    llm = get_llm(bind_tools=[web_search])
+    system = """You are a research specialist. Search for comprehensive, accurate information 
+    on the given task. Make 2-3 targeted searches. Be thorough."""
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=f"Research this topic thoroughly: {state['task']}")
+    ]
     response = llm.invoke(messages)
-    next_step = response.content.strip()
-    if "FINISH" in next_step.upper():
-        return {"next_agent": "FINISH", "status": "completed"}
-    for agent in ["Researcher", "Analyst", "Writer", "Critic"]:
-        if agent.upper() in next_step.upper():
-            return {"next_agent": agent}
-    return {"next_agent": "Researcher"}
+    notes = []
 
-researcher_node = create_agent(llm, tools, "You are a Researcher. Search for and gather information on the topic.")
-analyst_node    = create_agent(llm, [python_repl_tool], "You are an Analyst. Analyze data using Python when needed.")
-writer_node     = create_agent(llm, [], "You are a Writer. Synthesize findings into a clear professional report.")
-critic_node     = create_agent(llm, [], "You are a Critic. Review the draft. Reply 'APPROVED' if excellent, else give 'FEEDBACK'.")
+    # Process tool calls if any
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        for tc in response.tool_calls:
+            tool_fn = TOOL_MAP.get(tc["name"])
+            if tool_fn:
+                result = tool_fn.invoke(tc["args"])
+                notes.append(f"Search '{tc['args'].get('query', '')}': {result[:800]}")
+    else:
+        notes.append(response.content)
 
-tool_node = ToolNode(tools)
+    logger.info(f"[Researcher] Gathered {len(notes)} research notes")
+    return {
+        "research_notes": state.get("research_notes", []) + notes,
+        "messages": [AIMessage(content=f"Research complete: {len(notes)} findings")],
+    }
 
-def should_continue(state: AgentState):
-    last = state["messages"][-1]
-    if hasattr(last, "tool_calls") and last.tool_calls:
-        return "continue"
-    return "end"
 
-workflow = StateGraph(AgentState)
-workflow.add_node("Supervisor", supervisor_node)
-workflow.add_node("Researcher", researcher_node)
-workflow.add_node("Analyst",    analyst_node)
-workflow.add_node("Writer",     writer_node)
-workflow.add_node("Critic",     critic_node)
-workflow.add_node("tools",      tool_node)
+# ── Analyst ───────────────────────────────────────────────────────────────────
+def analyst_node(state: AgentState) -> dict:
+    """Analyzes research notes, may run Python for calculations."""
+    logger.info("[Analyst] Analyzing research...")
+    llm = get_llm(bind_tools=[python_repl])
+    context = "\n".join(state.get("research_notes", [])[:5])
+    system = """You are a data analyst. Analyze the research findings. 
+    If numerical analysis is needed, write Python code to compute it."""
+    response = llm.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=f"Task: {state['task']}\n\nResearch:\n{context}\n\nAnalyze and extract key insights."),
+    ])
+    analysis = [response.content]
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        for tc in response.tool_calls:
+            if tc["name"] == "python_repl":
+                result = python_repl.invoke(tc["args"])
+                analysis.append(f"Computation result: {result}")
 
-workflow.set_entry_point("Supervisor")
-workflow.add_conditional_edges("Supervisor", lambda x: x["next_agent"], {
-    "Researcher": "Researcher", "Analyst": "Analyst",
-    "Writer": "Writer", "Critic": "Critic", "FINISH": END
-})
-workflow.add_conditional_edges("Researcher", should_continue, {"continue": "tools", "end": "Supervisor"})
-workflow.add_conditional_edges("Analyst",    should_continue, {"continue": "tools", "end": "Supervisor"})
-workflow.add_edge("tools",   "Supervisor")
-workflow.add_edge("Writer",  "Supervisor")
-workflow.add_edge("Critic",  "Supervisor")
+    return {
+        "analysis_results": state.get("analysis_results", []) + analysis,
+        "messages": [AIMessage(content="Analysis complete")],
+    }
 
-memory = MemorySaver()
-app = workflow.compile(checkpointer=memory, interrupt_before=["Critic"])
+
+# ── Writer ────────────────────────────────────────────────────────────────────
+def writer_node(state: AgentState) -> dict:
+    """Synthesizes research + analysis into a coherent answer."""
+    logger.info("[Writer] Drafting answer...")
+    llm = get_llm()
+    context = "\n\n".join([
+        "RESEARCH:\n" + "\n".join(state.get("research_notes", [])[:4]),
+        "ANALYSIS:\n" + "\n".join(state.get("analysis_results", [])[:2]),
+        "PREVIOUS FEEDBACK:\n" + (state.get("critic_feedback") or "None"),
+    ])
+    system = """You are a technical writer. Write a clear, comprehensive, well-structured answer.
+    Use headings, bullet points where appropriate. Cite sources when available."""
+    response = llm.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=f"Task: {state['task']}\n\nContext:\n{context}\n\nWrite the final answer:"),
+    ])
+    logger.info("[Writer] Draft complete")
+    return {
+        "draft_answer": response.content,
+        "messages": [AIMessage(content="Draft written")],
+    }
+
+
+# ── Critic ────────────────────────────────────────────────────────────────────
+def critic_node(state: AgentState) -> dict:
+    """Evaluates the draft and decides if it's complete or needs revision."""
+    logger.info("[Critic] Evaluating draft...")
+    llm = get_llm()
+    system = """You are a critical reviewer. Evaluate the answer on:
+    1. Accuracy and factual correctness
+    2. Completeness (does it fully answer the task?)
+    3. Clarity and structure
+    
+    Respond with: APPROVED: <brief comment> OR REVISION NEEDED: <specific improvements>"""
+    response = llm.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=f"Task: {state['task']}\n\nAnswer:\n{state.get('draft_answer', '')}\n\nEvaluate:"),
+    ])
+    feedback = response.content
+    is_complete = feedback.upper().startswith("APPROVED")
+    logger.info(f"[Critic] {'Approved' if is_complete else 'Revision needed'}")
+
+    return {
+        "critic_feedback": feedback,
+        "final_answer": state.get("draft_answer", "") if is_complete else "",
+        "is_complete": is_complete,
+        "messages": [AIMessage(content=feedback)],
+    }
